@@ -16,16 +16,21 @@ jobs:
           python-version: "3.12"
 
       - name: Instalar dependencias
-        run: pip install pyinstaller opencv-python numpy imageio-ffmpeg
+        run: pip install pyinstaller opencv-python numpy imageio-ffmpeg tkinterdnd2
 
-      - name: Compilar con PyInstaller
+      - name: Compilar la interfaz grafica (QuitarMarca.exe)
+        run: pyinstaller --onefile --windowed --name QuitarMarca --collect-all imageio_ffmpeg --collect-all tkinterdnd2 quitar_marca_gui.py
+
+      - name: Compilar la version de linea de comandos (quitar_marca.exe)
         run: pyinstaller --onefile --console --name quitar_marca --collect-all imageio_ffmpeg quitar_marca.py
 
-      - name: Probar que el exe arranca
+      - name: Probar que la version de consola arranca
         run: dist\quitar_marca.exe --help
 
-      - name: Subir el exe
+      - name: Subir los exe
         uses: actions/upload-artifact@v4
         with:
           name: quitar_marca-windows
-          path: dist/quitar_marca.exe
+          path: |
+            dist/QuitarMarca.exe
+            dist/quitar_marca.exe
