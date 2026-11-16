@@ -61,7 +61,7 @@ def zona_interactiva(imagen):
     x, y, w, h = cv2.selectROI(titulo, vista, showCrosshair=False)
     cv2.destroyAllWindows()
     if w == 0 or h == 0:
-        sys.exit("No se selecciono ninguna zona.")
+        raise ValueError("No se selecciono ninguna zona.")
     return (int(x / escala), int(y / escala), int(w / escala), int(h / escala))
 
 
@@ -103,10 +103,13 @@ def crear_mascara(ancho_img, alto_img, zona):
 
 # ---------------------------------------------------------- inpainting
 
-def limpiar_cuadro(cuadro, zona, radio, metodo):
+def limpiar_cuadro(cuadro, zona, radio, metodo, mascara_zona=None, grano=True):
     """
-    Aplica inpainting solo sobre un recorte alrededor de la zona
-    (mucho mas rapido que procesar el cuadro completo).
+    Aplica inpainting solo sobre un recorte alrededor de la zona.
+    - mascara_zona: mascara del tamano de la zona con SOLO los pixeles de la
+      marca (255). Si es None se rellena el rectangulo completo.
+    - grano: agrega al relleno el mismo ruido/grano que tiene el entorno,
+      para que no se vea como un parche liso y borroso.
     """
     alto, ancho = cuadro.shape[:2]
     x, y, w, h = zona
@@ -116,11 +119,88 @@ def limpiar_cuadro(cuadro, zona, radio, metodo):
 
     recorte = cuadro[y0:y1, x0:x1]
     mascara = np.zeros(recorte.shape[:2], dtype=np.uint8)
-    mascara[y - y0:y - y0 + h, x - x0:x - x0 + w] = 255
+    if mascara_zona is None:
+        mascara[y - y0:y - y0 + h, x - x0:x - x0 + w] = 255
+    else:
+        mascara[y - y0:y - y0 + h, x - x0:x - x0 + w] = mascara_zona
 
     bandera = cv2.INPAINT_NS if metodo == "ns" else cv2.INPAINT_TELEA
-    cuadro[y0:y1, x0:x1] = cv2.inpaint(recorte, mascara, radio, bandera)
+    relleno = cv2.inpaint(recorte, mascara, radio, bandera)
+
+    if grano:
+        relleno = agregar_grano(recorte, relleno, mascara)
+
+    cuadro[y0:y1, x0:x1] = relleno
     return cuadro
+
+
+def agregar_grano(original, relleno, mascara):
+    """Mide el ruido fino alrededor de la marca y lo replica en el relleno."""
+    dentro = mascara > 0
+    fuera = ~dentro
+    if dentro.sum() == 0 or fuera.sum() < 50:
+        return relleno
+    orig_f = original.astype(np.float32)
+    residuo = orig_f - cv2.GaussianBlur(orig_f, (0, 0), 1.5)
+    # Desviacion robusta (MAD) para no contar bordes reales como ruido
+    valores = residuo[fuera]
+    sigma = 1.4826 * np.median(np.abs(valores - np.median(valores)))
+    if sigma < 0.3:
+        return relleno
+    sigma = min(float(sigma), 12.0)
+    ruido = np.random.normal(0.0, sigma, relleno.shape).astype(np.float32)
+    salida = relleno.astype(np.float32)
+    salida[dentro] += ruido[dentro]
+    return np.clip(salida, 0, 255).astype(np.uint8)
+
+
+def detectar_mascara_video(ruta, zona, muestras=40, expandir=3):
+    """
+    Encuentra los pixeles exactos de una marca FIJA dentro de la zona.
+    El fondo cambia de un cuadro a otro pero la marca no: sus bordes aparecen
+    en el mismo lugar en todos los cuadros. La mediana de los bordes a lo
+    largo del video deja solo la marca.
+    Devuelve una mascara (h, w) o None si no se pudo aislar con confianza.
+    """
+    x, y, w, h = zona
+    captura = cv2.VideoCapture(ruta)
+    total = int(captura.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total < 8:
+        captura.release()
+        return None
+    indices = np.linspace(0, total - 1, min(muestras, total)).astype(int)
+    bordes = []
+    for i in indices:
+        captura.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ok, cuadro = captura.read()
+        if not ok:
+            continue
+        gris = cv2.cvtColor(cuadro[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gx = cv2.Sobel(gris, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gris, cv2.CV_32F, 0, 1, ksize=3)
+        bordes.append(cv2.magnitude(gx, gy))
+    captura.release()
+    if len(bordes) < 8:
+        return None
+
+    mediana = np.median(np.stack(bordes), axis=0)
+    norma = cv2.normalize(mediana, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, binaria = cv2.threshold(norma, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Unir trazos y rellenar el interior de letras/logos
+    nucleo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cerrada = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, nucleo, iterations=2)
+    contornos, _ = cv2.findContours(cerrada, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mascara = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mascara, contornos, -1, 255, thickness=cv2.FILLED)
+    if expandir > 0:
+        k = 2 * expandir + 1
+        mascara = cv2.dilate(mascara, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+
+    cobertura = float((mascara > 0).mean())
+    if cobertura < 0.005 or cobertura > 0.75:
+        return None
+    return mascara
 
 
 # -------------------------------------------------------------- imagen
@@ -153,7 +233,8 @@ def procesar_imagen(entrada, salida, args):
         guardar_vista_previa(imagen, zona, salida)
         return True
 
-    resultado = limpiar_cuadro(imagen, zona, args.radio, args.metodo)
+    resultado = limpiar_cuadro(imagen, zona, args.radio, args.metodo,
+                               None, not args.sin_grano)
     guardar_imagen(salida, resultado)
     print("  [ok] " + salida + "  (zona x,y,w,h = " + str(zona) + ")")
     return True
@@ -193,7 +274,7 @@ def buscar_ffmpeg():
     return shutil.which("ffmpeg")
 
 
-def procesar_video(entrada, salida, args):
+def procesar_video(entrada, salida, args, progreso=None):
     captura = cv2.VideoCapture(entrada)
     if not captura.isOpened():
         print("  [x] No se pudo abrir el video: " + entrada)
@@ -216,6 +297,17 @@ def procesar_video(entrada, salida, args):
         captura.release()
         return True
 
+    mascara_zona = None
+    if not args.rectangulo:
+        mascara_zona = detectar_mascara_video(entrada, zona, expandir=args.expandir)
+        if mascara_zona is None:
+            print("  (no se pudo aislar la marca; se rellena el rectangulo completo)")
+        else:
+            pct = 100.0 * float((mascara_zona > 0).mean())
+            print("  marca aislada: se retoca solo el %.0f%% de la zona" % pct)
+            if args.guardar_mascara:
+                guardar_imagen(os.path.splitext(salida)[0] + "_mascara.png", mascara_zona)
+
     ffmpeg = buscar_ffmpeg()
     if ffmpeg is None:
         captura.release()
@@ -237,16 +329,23 @@ def procesar_video(entrada, salida, args):
         "-c:a", "copy", "-shortest",
         salida,
     ]
-    proceso = subprocess.Popen(comando, stdin=subprocess.PIPE)
+    # CREATE_NO_WINDOW evita que parpadee una consola negra en Windows
+    proceso = subprocess.Popen(
+        comando, stdin=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
     cuadro = primer
     n = 0
     try:
         while ok:
-            limpio = limpiar_cuadro(cuadro, zona, args.radio, args.metodo)
+            limpio = limpiar_cuadro(cuadro, zona, args.radio, args.metodo,
+                                    mascara_zona, not args.sin_grano)
             proceso.stdin.write(limpio.tobytes())
             n += 1
-            if n % 30 == 0 or n == total:
+            if progreso is not None:
+                progreso(n, total)
+            elif n % 30 == 0 or n == total:
                 pct = (100.0 * n / total) if total > 0 else 0.0
                 sys.stdout.write("\r  procesando... %d/%d cuadros (%.0f%%)" % (n, total, pct))
                 sys.stdout.flush()
@@ -284,18 +383,40 @@ def listar_archivos(ruta):
         for nombre in sorted(os.listdir(ruta)):
             ext = os.path.splitext(nombre)[1].lower()
             if ext in EXT_IMAGEN or ext in EXT_VIDEO:
-                if "_limpio" in nombre or "_vista_previa" in nombre:
+                if "_limpio" in nombre or "_vista_previa" in nombre or "_mascara" in nombre:
                     continue
                 archivos.append(os.path.join(ruta, nombre))
         return archivos
     return [ruta]
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Quita una marca de agua fija de fotos y videos."
+def elegir_archivos():
+    """Abre el cuadro de dialogo de Windows para elegir fotos/videos."""
+    import tkinter
+    from tkinter import filedialog
+    raiz = tkinter.Tk()
+    raiz.withdraw()
+    raiz.attributes("-topmost", True)
+    patrones = " ".join("*" + e for e in sorted(EXT_IMAGEN | EXT_VIDEO))
+    rutas = filedialog.askopenfilenames(
+        title="Elige las fotos o videos a limpiar",
+        filetypes=[("Fotos y videos", patrones), ("Todos los archivos", "*.*")],
     )
-    parser.add_argument("entrada", help="Archivo o carpeta con fotos/videos")
+    raiz.destroy()
+    return list(rutas)
+
+
+PAUSAR_AL_SALIR = False
+
+
+def main():
+    global PAUSAR_AL_SALIR
+    parser = argparse.ArgumentParser(
+        description="Quita una marca de agua fija de fotos y videos. "
+                    "Sin argumentos (doble clic) abre un selector de archivos "
+                    "y deja marcar la zona con el mouse."
+    )
+    parser.add_argument("entrada", nargs="*", help="Archivos o carpetas con fotos/videos")
     parser.add_argument("-o", "--salida", help="Carpeta de salida (por defecto, la misma)")
 
     grupo = parser.add_argument_group("zona de la marca (elige una forma)")
@@ -315,18 +436,42 @@ def main():
                         help="Radio de inpainting; mas alto = relleno mas suave (por defecto 5)")
     parser.add_argument("--metodo", choices=["telea", "ns"], default="telea",
                         help="Algoritmo de inpainting (por defecto telea)")
+    parser.add_argument("--rectangulo", action="store_true",
+                        help="Video: rellenar todo el rectangulo en vez de aislar la marca")
+    parser.add_argument("--expandir", type=int, default=3,
+                        help="Video: pixeles extra alrededor de la marca aislada (por defecto 3)")
+    parser.add_argument("--guardar-mascara", action="store_true",
+                        help="Video: guarda la mascara detectada como PNG para revisarla")
+    parser.add_argument("--sin-grano", action="store_true",
+                        help="No agregar grano al relleno")
     parser.add_argument("--crf", type=int, default=18,
                         help="Calidad del video: 0-51, menor = mejor (por defecto 18)")
     parser.add_argument("--vista-previa", action="store_true",
                         help="Solo guarda una imagen con la zona marcada en rojo")
+
+    # Doble clic (sin argumentos) o archivos arrastrados sobre el .exe:
+    # modo guiado, con seleccion de zona por mouse y pausa al terminar.
+    sin_opciones = all(not a.startswith("-") for a in sys.argv[1:])
     args = parser.parse_args()
+    if sin_opciones:
+        PAUSAR_AL_SALIR = True
+        args.seleccionar = True
+        if not args.entrada:
+            print("Elige las fotos o videos en la ventana que se abrio...")
+            args.entrada = elegir_archivos()
+            if not args.entrada:
+                sys.exit("No elegiste ningun archivo.")
+        print("En cada archivo: dibuja un rectangulo sobre la marca y presiona ENTER.\n")
+    elif not args.entrada:
+        parser.error("falta el archivo o carpeta de entrada")
 
-    if not os.path.exists(args.entrada):
-        sys.exit("No existe: " + args.entrada)
-
-    archivos = listar_archivos(args.entrada)
+    archivos = []
+    for ruta in args.entrada:
+        if not os.path.exists(ruta):
+            sys.exit("No existe: " + ruta)
+        archivos.extend(listar_archivos(ruta))
     if not archivos:
-        sys.exit("No se encontraron fotos ni videos en " + args.entrada)
+        sys.exit("No se encontraron fotos ni videos.")
 
     exitos = 0
     for archivo in archivos:
@@ -345,4 +490,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    CODIGO_SALIDA = 0
+    try:
+        main()
+    except SystemExit as salida:
+        if isinstance(salida.code, str):
+            print(salida.code)
+            CODIGO_SALIDA = 1
+        else:
+            CODIGO_SALIDA = salida.code or 0
+    except Exception as error:
+        PAUSAR_AL_SALIR = True
+        CODIGO_SALIDA = 1
+        print("\nError inesperado: " + repr(error))
+    finally:
+        if PAUSAR_AL_SALIR:
+            try:
+                input("\nPresiona ENTER para cerrar esta ventana...")
+            except EOFError:
+                pass
+    sys.exit(CODIGO_SALIDA)
